@@ -90,6 +90,12 @@ function sendHtml(res, html) {
 }
 
 function parseBody(req) {
+  if (req.body && typeof req.body === 'object') {
+    return Promise.resolve(req.body);
+  }
+  if (typeof req.body === 'string') {
+    try { return Promise.resolve(JSON.parse(req.body)); } catch (e) {}
+  }
   return new Promise((resolve) => {
     let body = '';
     req.on('data', chunk => { body += chunk; });
@@ -100,19 +106,28 @@ function parseBody(req) {
         resolve({});
       }
     });
+    setTimeout(() => {
+      try { resolve(JSON.parse(body || '{}')); } catch (e) { resolve({}); }
+    }, 1500);
   });
 }
 
 // Main Request Handler
 async function handler(req, res) {
   const parsed = url.parse(req.url, true);
-  const path = parsed.pathname;
+  const rawPath = parsed.pathname || '/';
+  const normPath = rawPath.replace(/\/+$/, '') || '/';
+  const isStatus = normPath === '/status' || normPath.endsWith('/status');
+  const isActivate = normPath === '/license/activate' || normPath.endsWith('/license/activate') || normPath.includes('activate');
+  const isValidate = normPath === '/session/validate' || normPath.endsWith('/session/validate') || normPath.includes('validate');
+  const isRefresh = normPath === '/session/refresh' || normPath.endsWith('/session/refresh') || normPath.includes('refresh');
+  const isAuthorize = normPath === '/feature/authorize' || normPath.endsWith('/feature/authorize') || normPath.includes('authorize');
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Installation-ID'
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Installation-ID, X-Feature-Token'
     });
     res.end();
     return;
@@ -120,21 +135,32 @@ async function handler(req, res) {
 
   const now = Math.floor(Date.now() / 1000);
 
-  // Status check
-  if (path === '/status') {
+  // Status check - Provides all parameters required by iOS App telemetry & cloud indicator
+  if (isStatus) {
     sendJson(res, 200, {
-      server: 'HOOK REGEDIT VERCEL API',
+      server: 'HOOK REGEDIT',
       status: DB.maintenance ? 'maintenance' : 'online',
+      server_available: !DB.maintenance,
+      plan_authorized: true,
       maintenance: DB.maintenance,
       maintenance_message: DB.maintenance_message,
       time: now,
-      kv_enabled: Boolean(KV_URL)
+      kv_enabled: Boolean(KV_URL),
+      game: {
+        bundle_identifier: 'com.dts.freefiremax',
+        displayName: 'FREE FIRE MAX'
+      },
+      features: [
+        'BODY', 'CHEST', 'NECK', 'MOD_SKINS', 'ESP',
+        'HOLOGRAM_GUN', 'THREE_D', 'DRAG',
+        'P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8'
+      ]
     });
     return;
   }
 
   // Admin: Get Keys List & Maintenance Status
-  if (path === '/api/admin/keys') {
+  if (normPath === '/api/admin/keys') {
     const list = Object.values(DB.licenses).map(lic => {
       let st = lic.status;
       if (st === 'active' && now > lic.expires_at) {
@@ -156,13 +182,13 @@ async function handler(req, res) {
   }
 
   // Admin Dashboard
-  if (path === '/' || path === '/admin') {
+  if (normPath === '/' || normPath === '/admin') {
     sendHtml(res, getDashboardHtml());
     return;
   }
 
   // Admin: Toggle Maintenance Mode
-  if (path === '/api/admin/maintenance' && req.method === 'POST') {
+  if (normPath === '/api/admin/maintenance' && req.method === 'POST') {
     const body = await parseBody(req);
     DB.maintenance = Boolean(body.maintenance);
     if (body.message) {
@@ -180,7 +206,7 @@ async function handler(req, res) {
   }
 
   // Check Maintenance Mode for App Endpoints
-  if (DB.maintenance && (path === '/license/activate' || path === '/session/validate' || path === '/session/refresh')) {
+  if (DB.maintenance && (isActivate || isValidate || isRefresh || isAuthorize)) {
     sendJson(res, 503, {
       error: DB.maintenance_message || "Server is under maintenance. Please try again later.",
       status: "maintenance",
@@ -189,11 +215,11 @@ async function handler(req, res) {
     return;
   }
 
-  // POST: Activate License
-  if (path === '/license/activate' && req.method === 'POST') {
+  // Activate License (matches /license/activate, /api/license/activate, etc.)
+  if (isActivate) {
     const body = await parseBody(req);
-    const key = (body.license_key || '').trim();
-    const device_model = body.device_model || 'iPhone';
+    const key = ((body.license_key || body.key || parsed.query.license_key || parsed.query.key) || '').trim();
+    const device_model = body.device_model || parsed.query.device_model || 'iPhone';
 
     if (!key) {
       sendJson(res, 400, { error: 'license_key is required' });
@@ -250,19 +276,32 @@ async function handler(req, res) {
       status: 'active',
       plan: 'VIP PREMIUM',
       license_key: key,
+      server_available: true,
+      plan_authorized: true,
       activated_at: lic.activated_at,
       expires_at: lic.expires_at,
       duration_days: lic.duration_days,
       days_left: daysLeft,
       token,
+      access_token: token,
+      session_token: token,
       refresh_token,
+      game: {
+        bundle_identifier: 'com.dts.freefiremax',
+        displayName: 'FREE FIRE MAX'
+      },
+      features: [
+        'BODY', 'CHEST', 'NECK', 'MOD_SKINS', 'ESP',
+        'HOLOGRAM_GUN', 'THREE_D', 'DRAG',
+        'P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8'
+      ],
       message: `License Active! ${daysLeft} Days Remaining`
     });
     return;
   }
 
-  // POST: Validate Session
-  if (path === '/session/validate' && req.method === 'POST') {
+  // Validate Session
+  if (isValidate) {
     const body = await parseBody(req);
     const token = body.token || (req.headers['authorization'] || '').replace('Bearer ', '');
     const session = DB.sessions[token];
@@ -279,6 +318,9 @@ async function handler(req, res) {
 
     sendJson(res, 200, {
       valid: true,
+      success: true,
+      server_available: true,
+      plan_authorized: true,
       license_key: session.key,
       expires_at: session.expires_at,
       days_left: Math.round(((session.expires_at - now) / 86400) * 10) / 10
@@ -286,8 +328,33 @@ async function handler(req, res) {
     return;
   }
 
+  // Refresh Session
+  if (isRefresh) {
+    const body = await parseBody(req);
+    const token = 'ffa_' + crypto.randomBytes(16).toString('hex');
+    const refresh_token = 'ffr_' + crypto.randomBytes(16).toString('hex');
+    sendJson(res, 200, {
+      success: true,
+      token,
+      access_token: token,
+      refresh_token
+    });
+    return;
+  }
+
+  // Feature Authorize
+  if (isAuthorize) {
+    sendJson(res, 200, {
+      success: true,
+      authorized: true,
+      plan_authorized: true,
+      server_available: true
+    });
+    return;
+  }
+
   // Admin: Generate Keys
-  if (path === '/api/admin/generate' && req.method === 'POST') {
+  if (normPath === '/api/admin/generate' && req.method === 'POST') {
     const body = await parseBody(req);
     const count = parseInt(body.count || 5);
     const duration = parseInt(body.duration_days || 7);
@@ -315,7 +382,7 @@ async function handler(req, res) {
   }
 
   // Admin: Revoke Key
-  if (path === '/api/admin/revoke' && req.method === 'POST') {
+  if (normPath === '/api/admin/revoke' && req.method === 'POST') {
     const body = await parseBody(req);
     const key = body.license_key;
     if (DB.licenses[key]) {
