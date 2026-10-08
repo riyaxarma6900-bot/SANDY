@@ -28,7 +28,9 @@ const PRESET_KEYS = [
 // In-Memory Database store
 let DB = {
   licenses: {},
-  sessions: {}
+  sessions: {},
+  maintenance: false,
+  maintenance_message: "Server is under maintenance. Please try again later."
 };
 
 // Initialize preset keys
@@ -122,14 +124,16 @@ async function handler(req, res) {
   if (path === '/status') {
     sendJson(res, 200, {
       server: 'HOOK REGEDIT VERCEL API',
-      status: 'online',
+      status: DB.maintenance ? 'maintenance' : 'online',
+      maintenance: DB.maintenance,
+      maintenance_message: DB.maintenance_message,
       time: now,
       kv_enabled: Boolean(KV_URL)
     });
     return;
   }
 
-  // Admin: Get Keys List
+  // Admin: Get Keys List & Maintenance Status
   if (path === '/api/admin/keys') {
     const list = Object.values(DB.licenses).map(lic => {
       let st = lic.status;
@@ -143,13 +147,45 @@ async function handler(req, res) {
         days_left: Math.round((rem / 86400) * 10) / 10
       };
     });
-    sendJson(res, 200, { keys: list });
+    sendJson(res, 200, { 
+      keys: list,
+      maintenance: DB.maintenance,
+      maintenance_message: DB.maintenance_message
+    });
     return;
   }
 
   // Admin Dashboard
   if (path === '/' || path === '/admin') {
     sendHtml(res, getDashboardHtml());
+    return;
+  }
+
+  // Admin: Toggle Maintenance Mode
+  if (path === '/api/admin/maintenance' && req.method === 'POST') {
+    const body = await parseBody(req);
+    DB.maintenance = Boolean(body.maintenance);
+    if (body.message) {
+      DB.maintenance_message = body.message;
+    }
+    if (KV_URL) {
+      await kvSet('app:maintenance', { maintenance: DB.maintenance, message: DB.maintenance_message });
+    }
+    sendJson(res, 200, {
+      success: true,
+      maintenance: DB.maintenance,
+      message: DB.maintenance_message
+    });
+    return;
+  }
+
+  // Check Maintenance Mode for App Endpoints
+  if (DB.maintenance && (path === '/license/activate' || path === '/session/validate' || path === '/session/refresh')) {
+    sendJson(res, 503, {
+      error: DB.maintenance_message || "Server is under maintenance. Please try again later.",
+      status: "maintenance",
+      maintenance: true
+    });
     return;
   }
 
@@ -164,7 +200,6 @@ async function handler(req, res) {
       return;
     }
 
-    // Try KV or memory
     let lic = DB.licenses[key];
     if (!lic && KV_URL) {
       lic = await kvGet(`lic:${key}`);
@@ -180,7 +215,6 @@ async function handler(req, res) {
       return;
     }
 
-    // First time activation -> 7 Days timer start!
     if (lic.status === 'unused') {
       lic.status = 'active';
       lic.activated_at = now;
@@ -193,7 +227,7 @@ async function handler(req, res) {
         lic.status = 'expired';
         DB.licenses[key] = lic;
         sendJson(res, 403, {
-          error: 'License Expired! Your 7 days validity has ended.',
+          error: `License Expired! Your ${lic.duration_days} days validity has ended.`,
           status: 'expired',
           expired_at: lic.expires_at
         });
@@ -239,7 +273,7 @@ async function handler(req, res) {
     }
 
     if (now > session.expires_at) {
-      sendJson(res, 403, { error: 'Session Expired! 7 Days completed.' });
+      sendJson(res, 403, { error: 'Session Expired!' });
       return;
     }
 
@@ -256,7 +290,9 @@ async function handler(req, res) {
   if (path === '/api/admin/generate' && req.method === 'POST') {
     const body = await parseBody(req);
     const count = parseInt(body.count || 5);
+    const duration = parseInt(body.duration_days || 7);
     const generated = [];
+
     for (let i = 0; i < count; i++) {
       const p1 = crypto.randomBytes(2).toString('hex').toUpperCase();
       const p2 = crypto.randomBytes(2).toString('hex').toUpperCase();
@@ -264,7 +300,7 @@ async function handler(req, res) {
       const k = `HOOK-${p1}-${p2}-${p3}`;
       DB.licenses[k] = {
         key: k,
-        duration_days: 7,
+        duration_days: duration,
         status: 'unused',
         activated_at: 0,
         expires_at: 0,
@@ -274,7 +310,7 @@ async function handler(req, res) {
       if (KV_URL) await kvSet(`lic:${k}`, DB.licenses[k]);
       generated.push(k);
     }
-    sendJson(res, 200, { success: true, generated });
+    sendJson(res, 200, { success: true, duration_days: duration, generated });
     return;
   }
 
@@ -315,17 +351,39 @@ function getDashboardHtml() {
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   body { background: var(--bg); color: var(--text); padding: 30px 20px; min-height: 100vh; }
   .container { max-width: 1100px; margin: 0 auto; }
-  header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid var(--border); padding-bottom: 20px; margin-bottom: 30px; }
+  header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid var(--border); padding-bottom: 20px; margin-bottom: 25px; }
   .logo-title { display: flex; align-items: center; gap: 15px; }
   .logo-badge { background: linear-gradient(135deg, #ff2a2a, #aa0000); color: #fff; padding: 10px 18px; border-radius: 12px; font-weight: 900; font-size: 20px; box-shadow: 0 0 20px var(--primary-glow); }
   h1 { font-size: 26px; font-weight: 800; }
   .subtitle { color: var(--text-muted); font-size: 13px; margin-top: 3px; }
-  .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 30px; }
+  
+  .maintenance-banner { display: none; background: #351010; border: 1px solid #ff2a2a; color: #ff6b6b; padding: 14px 20px; border-radius: 10px; margin-bottom: 25px; font-weight: 700; font-size: 14px; box-shadow: 0 0 20px rgba(255,42,42,0.3); animation: pulse 2s infinite; }
+  @keyframes pulse { 0% { opacity: 0.8; } 50% { opacity: 1; } 100% { opacity: 0.8; } }
+  
+  .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 25px; }
   .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; text-align: center; }
   .stat-val { font-size: 32px; font-weight: 800; margin-top: 5px; color: var(--primary); }
-  .actions-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 30px; display: flex; gap: 15px; align-items: center; flex-wrap: wrap; }
+  
+  .controls-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 30px; }
+  @media(max-width: 800px) { .controls-grid { grid-template-columns: 1fr; } }
+  
+  .card-box { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 22px; display: flex; flex-direction: column; gap: 15px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+  .card-title { font-size: 15px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); padding-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
+  
+  .gen-group { display: flex; flex-direction: column; gap: 6px; }
+  .gen-group label { font-size: 12px; text-transform: uppercase; color: var(--text-muted); font-weight: 700; letter-spacing: 0.5px; }
+  select, input { background: #0b0d13; color: white; border: 1px solid #303848; padding: 11px 16px; border-radius: 8px; font-size: 14px; font-weight: 600; outline: none; }
+  select:focus, input:focus { border-color: var(--primary); box-shadow: 0 0 10px var(--primary-glow); }
+  
   button { background: var(--primary); color: white; border: none; padding: 12px 24px; border-radius: 8px; font-weight: 700; cursor: pointer; transition: 0.2s; box-shadow: 0 0 15px var(--primary-glow); }
   button:hover { background: #ff4747; transform: translateY(-2px); }
+  .btn-warning { background: #ff9900; box-shadow: 0 0 15px rgba(255,153,0,0.4); }
+  .btn-warning:hover { background: #ffaa22; }
+  .btn-success { background: #00cc66; box-shadow: 0 0 15px rgba(0,204,102,0.4); }
+  .btn-success:hover { background: #00dd77; }
+  .btn-secondary { background: #232936; box-shadow: none; }
+  .btn-secondary:hover { background: #2f3647; }
+  
   table { width: 100%; border-collapse: collapse; background: var(--card); border-radius: 12px; overflow: hidden; border: 1px solid var(--border); }
   th, td { padding: 14px 18px; text-align: left; border-bottom: 1px solid var(--border); }
   th { background: #1a1f2c; color: var(--text-muted); font-size: 13px; text-transform: uppercase; }
@@ -335,6 +393,8 @@ function getDashboardHtml() {
   .badge-active { background: #123324; color: var(--success); border: 1px solid var(--success); }
   .badge-expired { background: #351515; color: var(--primary); border: 1px solid var(--primary); }
   .badge-revoked { background: #222; color: #777; border: 1px solid #444; }
+  .copy-btn { background: #1c2230; color: #8fa1c4; border: 1px solid #2d374d; padding: 5px 10px; font-size: 11px; border-radius: 4px; box-shadow: none; cursor: pointer; margin-left: 8px; }
+  .copy-btn:hover { background: #2c354a; color: #fff; }
 </style>
 </head>
 <body>
@@ -344,14 +404,18 @@ function getDashboardHtml() {
       <div class="logo-badge">H</div>
       <div>
         <h1>HOOK REGEDIT // VERCEL CLOUD PORTAL</h1>
-        <div class="subtitle">07-Day Dynamic VIP License & Device Authentication API</div>
+        <div class="subtitle">Multi-Tier VIP License & Server Operations Center</div>
       </div>
     </div>
-    <div style="text-align: right;">
+    <div style="text-align: right;" id="serverStatusBadge">
       <span style="display: inline-block; width: 10px; height: 10px; background: #00ff88; border-radius: 50%; box-shadow: 0 0 10px #00ff88;"></span>
-      <span style="font-size: 13px; color: #00ff88; font-weight: bold; margin-left: 5px;">VERCEL SERVERLESS ONLINE</span>
+      <span style="font-size: 13px; color: #00ff88; font-weight: bold; margin-left: 5px;">SERVER ONLINE</span>
     </div>
   </header>
+
+  <div id="maintenanceAlert" class="maintenance-banner">
+    🚨 WARNING: SERVER IS CURRENTLY IN MAINTENANCE MODE! Users cannot activate keys or play.
+  </div>
 
   <div class="stats-row">
     <div class="stat-card">
@@ -372,16 +436,60 @@ function getDashboardHtml() {
     </div>
   </div>
 
-  <div class="actions-card">
-    <button onclick="generateKeys(5)">⚡ Generate 5 More Keys (7 Days)</button>
-    <button onclick="generateKeys(10)">⚡ Generate 10 More Keys</button>
-    <button style="background: #2a3142; box-shadow: none;" onclick="loadKeys()">🔄 Refresh Table</button>
+  <div class="controls-grid">
+    <!-- Card 1: Key Generator -->
+    <div class="card-box">
+      <div class="card-title">
+        <span>⚡ VIP Key Generator</span>
+        <span style="font-size: 11px; color: var(--text-muted); font-weight: normal;">Multi-Tier</span>
+      </div>
+      <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+        <div class="gen-group" style="flex: 1;">
+          <label>Validity:</label>
+          <select id="durationSelect">
+            <option value="1">⏱️ 1 Day (Trial)</option>
+            <option value="7" selected>⚡ 7 Days (Weekly)</option>
+            <option value="30">👑 30 Days (Monthly)</option>
+            <option value="60">🔥 60 Days (2 Months)</option>
+            <option value="365">💎 365 Days (1 Year)</option>
+          </select>
+        </div>
+        <div class="gen-group" style="flex: 1;">
+          <label>Quantity:</label>
+          <select id="countSelect">
+            <option value="1">1 Key</option>
+            <option value="5" selected>5 Keys</option>
+            <option value="10">10 Keys</option>
+            <option value="20">20 Keys</option>
+          </select>
+        </div>
+      </div>
+      <button onclick="generateCustomKeys()">⚡ Generate Selected Keys</button>
+    </div>
+
+    <!-- Card 2: Maintenance Mode Control -->
+    <div class="card-box">
+      <div class="card-title">
+        <span>🛠️ Server Maintenance Control</span>
+        <span id="maintStatusText" style="font-size: 12px; color: #00ff88; font-weight: bold;">[NORMAL]</span>
+      </div>
+      <div class="gen-group">
+        <label>Maintenance Message to Users:</label>
+        <input type="text" id="maintMessageInput" value="Server is under maintenance. Please try again later." />
+      </div>
+      <div style="display: flex; gap: 10px; margin-top: auto;">
+        <button id="maintToggleBtn" class="btn-warning" style="flex: 1;" onclick="toggleMaintenance()">
+          🚨 Turn ON Maintenance
+        </button>
+        <button class="btn-secondary" onclick="loadKeys()">🔄 Refresh</button>
+      </div>
+    </div>
   </div>
 
   <table>
     <thead>
       <tr>
-        <th>License Key (Prefix: HOOK-)</th>
+        <th>License Key</th>
         <th>Validity</th>
         <th>Status</th>
         <th>Remaining Time</th>
@@ -396,6 +504,8 @@ function getDashboardHtml() {
 </div>
 
 <script>
+let currentMaintenanceState = false;
+
 async function loadKeys() {
   try {
     const res = await fetch('/api/admin/keys');
@@ -403,6 +513,33 @@ async function loadKeys() {
     const tbody = document.getElementById('keysTable');
     tbody.innerHTML = '';
     
+    // Update Maintenance UI
+    currentMaintenanceState = Boolean(data.maintenance);
+    const maintAlert = document.getElementById('maintenanceAlert');
+    const maintText = document.getElementById('maintStatusText');
+    const maintBtn = document.getElementById('maintToggleBtn');
+    const statusBadge = document.getElementById('serverStatusBadge');
+    
+    if (currentMaintenanceState) {
+      maintAlert.style.display = 'block';
+      maintText.innerText = '[MAINTENANCE ACTIVE]';
+      maintText.style.color = '#ff2a2a';
+      maintBtn.className = 'btn-success';
+      maintBtn.innerText = '🟢 Turn OFF Maintenance (Resume)';
+      statusBadge.innerHTML = '<span style="display: inline-block; width: 10px; height: 10px; background: #ff2a2a; border-radius: 50%; box-shadow: 0 0 10px #ff2a2a;"></span><span style="font-size: 13px; color: #ff2a2a; font-weight: bold; margin-left: 5px;">MAINTENANCE MODE</span>';
+    } else {
+      maintAlert.style.display = 'none';
+      maintText.innerText = '[NORMAL]';
+      maintText.style.color = '#00ff88';
+      maintBtn.className = 'btn-warning';
+      maintBtn.innerText = '🚨 Turn ON Maintenance';
+      statusBadge.innerHTML = '<span style="display: inline-block; width: 10px; height: 10px; background: #00ff88; border-radius: 50%; box-shadow: 0 0 10px #00ff88;"></span><span style="font-size: 13px; color: #00ff88; font-weight: bold; margin-left: 5px;">SERVER ONLINE</span>';
+    }
+
+    if (data.maintenance_message) {
+      document.getElementById('maintMessageInput').value = data.maintenance_message;
+    }
+
     let total = data.keys.length;
     let unused = 0, active = 0, expired = 0;
 
@@ -412,12 +549,15 @@ async function loadKeys() {
       else expired++;
 
       let badgeClass = 'badge-' + k.status;
-      let remainingText = k.status === 'unused' ? '7 Days (Not started)' : (k.status === 'active' ? k.days_left + ' Days Left' : '0 Days (Ended)');
+      let remainingText = k.status === 'unused' ? k.duration_days + ' Days (Not started)' : (k.status === 'active' ? k.days_left + ' Days Left' : '0 Days (Ended)');
       
       const tr = document.createElement('tr');
       tr.innerHTML = \`
-        <td><span class="key-code">\${k.key}</span></td>
-        <td>\${k.duration_days} Days</td>
+        <td>
+          <span class="key-code">\${k.key}</span>
+          <button class="copy-btn" onclick="copyKey('\${k.key}', this)">Copy</button>
+        </td>
+        <td style="font-weight: 700; color: #ffb800;">\${k.duration_days} \${k.duration_days == 1 ? 'Day' : 'Days'}</td>
         <td><span class="badge \${badgeClass}">\${k.status}</span></td>
         <td style="font-weight: 600; color: \${k.status==='active' ? '#00ff88' : '#aaa'}">\${remainingText}</td>
         <td style="color: #aaa; font-size: 13px;">\${k.device_model || '—'}</td>
@@ -437,13 +577,42 @@ async function loadKeys() {
   }
 }
 
-async function generateKeys(count) {
-  await fetch('/api/admin/generate', {
+async function toggleMaintenance() {
+  const newState = !currentMaintenanceState;
+  const msg = document.getElementById('maintMessageInput').value;
+  const confirmMsg = newState 
+    ? 'Are you sure you want to turn ON Maintenance Mode?\\nUsers will not be able to activate or login.' 
+    : 'Turn OFF Maintenance Mode and resume normal access?';
+  
+  if(!confirm(confirmMsg)) return;
+
+  await fetch('/api/admin/maintenance', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ count: count })
+    body: JSON.stringify({ maintenance: newState, message: msg })
   });
   loadKeys();
+}
+
+async function generateCustomKeys() {
+  const duration = document.getElementById('durationSelect').value;
+  const count = document.getElementById('countSelect').value;
+
+  const res = await fetch('/api/admin/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ count: count, duration_days: duration })
+  });
+  const data = await res.json();
+  alert('Successfully generated ' + count + ' keys with ' + duration + ' Days validity!');
+  loadKeys();
+}
+
+function copyKey(key, btn) {
+  navigator.clipboard.writeText(key);
+  const oldText = btn.innerText;
+  btn.innerText = 'Copied!';
+  setTimeout(() => { btn.innerText = oldText; }, 1500);
 }
 
 async function revokeKey(key) {
