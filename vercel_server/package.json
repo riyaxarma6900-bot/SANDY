@@ -1,0 +1,10 @@
+{
+  "name": "hook-regedit-license-server",
+  "version": "1.0.0",
+  "description": "Vercel License API & Dashboard for HOOK REGEDIT",
+  "main": "api/index.js",
+  "scripts": {
+    "start": "node api/index.js"
+  },
+  "dependencies": {}
+}
